@@ -1,0 +1,193 @@
+-- ==========================================
+-- 1. การตั้งค่า Extensions และ Storage Buckets
+-- ==========================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- สร้าง Buckets (Private) พร้อมจำกัดชนิดและขนาดไฟล์
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types) VALUES 
+('photos', 'photos', false, 2097152, ARRAY['image/jpeg', 'image/png']),
+('submissions', 'submissions', false, 20971520, ARRAY['image/jpeg', 'image/png', 'application/pdf', 'video/mp4']),
+('materials', 'materials', false, 52428800, ARRAY['application/vnd.openxmlformats-officedocument.presentationml.presentation', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/pdf']);
+
+-- ==========================================
+-- 2. สร้างตารางข้อมูลพื้นฐาน
+-- ==========================================
+CREATE TABLE public.teachers (
+    user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE public.students (
+    id TEXT PRIMARY KEY CHECK (id ~ '^\d{11}$'),
+    title TEXT NOT NULL,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    section TEXT NOT NULL,
+    user_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE SET NULL,
+    photo_path TEXT
+);
+
+CREATE TABLE public.attempts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    kind TEXT CHECK (kind IN ('pre', 'post')),
+    score INTEGER NOT NULL,
+    answers JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, kind)
+);
+
+CREATE TABLE public.progress (
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL CHECK (unit BETWEEN 1 AND 5),
+    done BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY(user_id, unit)
+);
+
+CREATE TABLE public.submissions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    unit INTEGER NOT NULL,
+    kind TEXT CHECK (kind IN ('link', 'file')),
+    url TEXT,
+    storage_path TEXT,
+    note TEXT,
+    score INTEGER,
+    teacher_comment TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE public.materials (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title TEXT NOT NULL,
+    kind TEXT CHECK (kind IN ('file', 'link', 'video')),
+    url TEXT,
+    storage_path TEXT,
+    file_name TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ==========================================
+-- 3. ฟังก์ชันและ Trigger สำหรับความปลอดภัย
+-- ==========================================
+-- Security Definer: ตรวจสอบว่าเป็นครูหรือไม่
+CREATE OR REPLACE FUNCTION public.is_teacher() RETURNS BOOLEAN AS $$
+BEGIN
+  RETURN EXISTS (SELECT 1 FROM public.teachers WHERE user_id = auth.uid());
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+-- Trigger: ป้องกันผู้เรียนแก้คะแนน submissions ของตัวเอง
+CREATE OR REPLACE FUNCTION public.prevent_student_score_update() RETURNS TRIGGER AS $$
+BEGIN
+  IF NOT public.is_teacher() THEN
+    IF NEW.score IS DISTINCT FROM OLD.score OR NEW.teacher_comment IS DISTINCT FROM OLD.teacher_comment THEN
+      RAISE EXCEPTION 'ผู้เรียนไม่สามารถแก้ไขคะแนนหรือข้อเสนอแนะได้';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+CREATE TRIGGER trg_prevent_submission_grading
+  BEFORE UPDATE ON public.submissions
+  FOR EACH ROW EXECUTE FUNCTION public.prevent_student_score_update();
+
+-- Trigger: ผูก user_id ใหม่เข้ากับรหัสนักเรียนอัตโนมัติ
+CREATE OR REPLACE FUNCTION public.handle_new_user() RETURNS TRIGGER AS $$
+DECLARE
+  student_id TEXT;
+BEGIN
+  student_id := split_part(NEW.email, '@', 1);
+  IF student_id ~ '^\d{11}$' THEN
+    IF EXISTS (SELECT 1 FROM public.students WHERE id = student_id AND user_id IS NULL) THEN
+      UPDATE public.students SET user_id = NEW.id WHERE id = student_id;
+    ELSE
+      RAISE EXCEPTION 'รหัสนักศึกษาไม่ถูกต้อง หรือถูกลงทะเบียนใช้งานไปแล้ว';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- สร้าง View ผลคะแนนสำหรับครู
+CREATE VIEW public.results WITH (security_invoker = true) AS
+SELECT s.id, s.title, s.first_name, s.last_name, s.section, s.photo_path,
+       pre.score AS pre_score, post.score AS post_score,
+       CASE WHEN pre.score = 10 THEN 0.00
+            ELSE ROUND(((post.score - pre.score)::numeric / (10 - pre.score)::numeric), 2)
+       END AS normalized_gain
+FROM public.students s
+LEFT JOIN public.attempts pre ON pre.user_id = s.user_id AND pre.kind = 'pre'
+LEFT JOIN public.attempts post ON post.user_id = s.user_id AND post.kind = 'post';
+
+-- ==========================================
+-- 4. ตั้งค่า Row Level Security (RLS)
+-- ==========================================
+ALTER TABLE public.teachers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.students ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.progress ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.submissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.materials ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon;
+
+-- นโยบาย Teachers
+CREATE POLICY "ครูเห็นข้อมูลครู" ON public.teachers FOR SELECT TO authenticated USING (true);
+
+-- นโยบาย Students
+CREATE POLICY "ผู้ใช้เห็นข้อมูลตนเองและครูเห็นทั้งหมด" ON public.students FOR SELECT TO authenticated USING (user_id = auth.uid() OR public.is_teacher());
+CREATE POLICY "นักเรียนแก้ไขรูปตนเองได้" ON public.students FOR UPDATE TO authenticated USING (user_id = auth.uid());
+
+-- นโยบาย Attempts (คะแนนสอบ)
+CREATE POLICY "ผู้เรียนดูและเพิ่มคะแนนสอบตนเอง ครูดูทั้งหมด" ON public.attempts FOR SELECT TO authenticated USING (user_id = auth.uid() OR public.is_teacher());
+CREATE POLICY "ผู้เรียนเพิ่มคะแนนสอบได้" ON public.attempts FOR INSERT TO authenticated WITH CHECK (user_id = auth.uid());
+
+-- นโยบาย Progress (ความก้าวหน้า)
+CREATE POLICY "ผู้เรียนจัดการความก้าวหน้าตนเอง" ON public.progress FOR ALL TO authenticated USING (user_id = auth.uid() OR public.is_teacher()) WITH CHECK (user_id = auth.uid());
+
+-- นโยบาย Submissions (งานปฏิบัติ)
+CREATE POLICY "ผู้เรียนดูงานตนเอง ครูดูทั้งหมด" ON public.submissions FOR SELECT TO authenticated USING (user_id = auth.uid() OR public.is_teacher());
+CREATE POLICY "ผู้เรียนส่งงานตนเอง" ON public.submissions FOR INSERT TO authenticated WITH CHECK (user_id = auth.uid());
+CREATE POLICY "ผู้เรียนอัปเดตงาน ครูให้คะแนน" ON public.submissions FOR UPDATE TO authenticated USING (user_id = auth.uid() OR public.is_teacher());
+
+-- นโยบาย Materials (สื่อการสอน)
+CREATE POLICY "ทุกคนดูสื่อการสอนได้" ON public.materials FOR SELECT TO authenticated USING (true);
+CREATE POLICY "ครูจัดการสื่อได้ทั้งหมด" ON public.materials FOR ALL TO authenticated USING (public.is_teacher());
+
+-- ==========================================
+-- 5. นโยบาย Storage (RLS สำหรับไฟล์)
+-- ==========================================
+-- Photos
+CREATE POLICY "อ่านรูปภาพได้ทุกคน" ON storage.objects FOR SELECT TO authenticated USING (bucket_id = 'photos');
+CREATE POLICY "ผู้เรียนอัปโหลดรูปโฟลเดอร์ตนเอง" ON storage.objects FOR INSERT TO authenticated WITH CHECK (bucket_id = 'photos' AND (string_to_array(name, '/'))[1] = auth.uid()::text);
+CREATE POLICY "ผู้เรียนลบรูปตนเอง" ON storage.objects FOR DELETE TO authenticated USING (bucket_id = 'photos' AND (string_to_array(name, '/'))[1] = auth.uid()::text);
+
+-- Submissions
+CREATE POLICY "ครูดูงานได้ทั้งหมดและนักเรียนดูของตนเอง" ON storage.objects FOR SELECT TO authenticated USING (bucket_id = 'submissions' AND ((string_to_array(name, '/'))[1] = auth.uid()::text OR public.is_teacher()));
+CREATE POLICY "นักเรียนอัปโหลดงานโฟลเดอร์ตนเอง" ON storage.objects FOR INSERT TO authenticated WITH CHECK (bucket_id = 'submissions' AND (string_to_array(name, '/'))[1] = auth.uid()::text);
+
+-- Materials
+CREATE POLICY "ทุกคนอ่านสื่อได้" ON storage.objects FOR SELECT TO authenticated USING (bucket_id = 'materials');
+CREATE POLICY "ครูจัดการสื่อได้" ON storage.objects FOR ALL TO authenticated USING (bucket_id = 'materials' AND public.is_teacher());
+
+-- ==========================================
+-- 6. ข้อมูลจำลอง (Mock Data)
+-- ==========================================
+-- หมายเหตุ: การนำเข้ารายชื่อจริง ให้ใช้ Table Editor ใน Supabase Import ไฟล์ CSV เข้าตาราง students ได้เลย
+INSERT INTO public.students (id, title, first_name, last_name, section) VALUES
+('11111111111', 'นาย', 'สมชาย', 'เรียนดี', '4/1'),
+('22222222222', 'นางสาว', 'สมหญิง', 'ขยันยิ่ง', '4/1'),
+('33333333333', 'นาย', 'ใจเด็ด', 'มุ่งมั่น', '4/2'),
+('44444444444', 'นางสาว', 'นารี', 'รักษ์โลก', '4/2'),
+('55555555555', 'นาย', 'วีระ', 'เทคโน', '4/3'),
+('66666666666', 'นางสาว', 'สุดา', 'สว่างวิทย์', '4/3');
+
+-- คำสั่งแต่งตั้งครู (ครูสมัครบัญชีแล้ว นำอีเมลมาใส่แทน teacher@school.ac.th นำเครื่องหมาย -- ออกแล้วรัน)
+-- INSERT INTO public.teachers (user_id) 
+-- SELECT id FROM auth.users WHERE email = 'teacher@school.ac.th';
